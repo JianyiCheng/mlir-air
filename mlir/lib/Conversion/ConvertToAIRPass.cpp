@@ -869,6 +869,12 @@ void HoistingAffineIf(mlir::AffineIfOp op) {
 
   // Hoist hierarchy op into scf op
   module_builder.setInsertionPoint(hier_op);
+  MemRefType externalMemrefTy =
+      externalGetPut[0].getMemref().getType().cast<MemRefType>();
+  if (externalMemrefTy.getMemorySpaceAsInt() == (int)air::MemorySpace::L3 &&
+      segment) {
+    module_builder.setInsertionPoint(segment);
+  }
 
   // Exclude herd's iteration space since broadcasted copies are already
   // specialized
@@ -893,8 +899,15 @@ void HoistingAffineIf(mlir::AffineIfOp op) {
     remap.map(herd.getIds()[0], zero_const_op);
     remap.map(herd.getIds()[1], zero_const_op);
     int arg_idx = 0;
-    for (auto arg : herd.getKernelArguments())
-      remap.map(arg, herd.getKernelOperand(arg_idx++));
+    if (externalMemrefTy.getMemorySpaceAsInt() == (int)air::MemorySpace::L3 &&
+        segment) {
+      // If hoisiting directly from herd to launch
+      for (auto arg : herd.getKernelArguments())
+        remap.map(arg, segment.getKernelOperand(arg_idx++));
+    } else {
+      for (auto arg : herd.getKernelArguments())
+        remap.map(arg, herd.getKernelOperand(arg_idx++));
+    }
 
     // Clone ops into hoisted scf.parallel
     module_builder.restoreInsertionPoint(insertionPointAtHierOp);
@@ -1041,7 +1054,14 @@ class AIRDmaToAIRChannelConversion
           insertionPointAtHierOp; // To keep a record of the insertion point as
                                   // destination for hoisting
       rewriter.setInsertionPoint(hier_op);
+      MemRefType externalMemrefTy =
+          externalGetPut[0].getMemref().getType().cast<MemRefType>();
       if (herd) {
+        if (externalMemrefTy.getMemorySpaceAsInt() ==
+                (int)air::MemorySpace::L3 &&
+            segment) {
+          rewriter.setInsertionPoint(segment);
+        }
         // Scf parallel shape is either herd shape, or channel set shape if
         // broadcasting
         SmallVector<int, 2> lbs;
@@ -1086,8 +1106,16 @@ class AIRDmaToAIRChannelConversion
         remap.map(herd.getIds()[0], scf_par.getInductionVars()[0]);
         remap.map(herd.getIds()[1], scf_par.getInductionVars()[1]);
         int arg_idx = 0;
-        for (auto arg : herd.getKernelArguments())
-          remap.map(arg, herd.getKernelOperand(arg_idx++));
+        if (externalMemrefTy.getMemorySpaceAsInt() ==
+                (int)air::MemorySpace::L3 &&
+            segment) {
+          // If hoisting directly to launch region
+          for (auto arg : herd.getKernelArguments())
+            remap.map(arg, segment.getKernelOperand(arg_idx++));
+        } else {
+          for (auto arg : herd.getKernelArguments())
+            remap.map(arg, herd.getKernelOperand(arg_idx++));
+        }
 
         // Clone ops into hoisted scf.parallel
         rewriter.setInsertionPointToStart(scf_par.getBody());
@@ -1319,15 +1347,128 @@ LogicalResult normalizeScfParallel(scf::ParallelOp parOp,
   return success();
 }
 
+void InsertEmptyLaunchOverHerd(air::HerdOp op) {
+  OpBuilder builder(op);
+  if (op->getParentOfType<air::SegmentOp>()) {
+    return;
+  }
+  if (op->getParentOfType<air::LaunchOp>()) {
+    return;
+  }
+
+  auto loc = op.getLoc();
+
+  SmallVector<Value, 4> args;
+  for (unsigned i = 0; i < op.getNumKernelOperands(); i++) {
+    args.push_back(op.getKernelOperand(i));
+  }
+  SmallVector<Value, 4> sizes;
+  // Generate a surrounding launch op with size of 1.
+  for (unsigned i = 0; i < op.getNumDims(); i++)
+    sizes.push_back(builder.create<arith::ConstantIndexOp>(loc, 1));
+
+  // The outermost launch op inherits herd's async interface
+  air::LaunchOp launch = nullptr;
+  if (op.getAsyncToken())
+    launch = builder.create<air::LaunchOp>(
+        op.getLoc(), op.getAsyncDependencies(), sizes, args, true);
+  else
+    launch = builder.create<air::LaunchOp>(op.getLoc(), sizes, args);
+  builder.setInsertionPointToStart(&launch.getRegion().front());
+  SmallVector<Value, 1> segmentSizes = {};
+  SmallVector<Value, 4> segmentOpers;
+  for (Value v : launch.getIds()) {
+    segmentOpers.push_back(v);
+  }
+  for (Value v : launch.getSize()) {
+    segmentOpers.push_back(v);
+  }
+  for (Value v : launch.getKernelArguments()) {
+    segmentOpers.push_back(v);
+  }
+
+  air::SegmentOp segment = nullptr;
+  if (op.getAsyncToken())
+    segment = builder.create<air::SegmentOp>(op.getLoc(), SmallVector<Value>{},
+                                             segmentSizes, segmentOpers, true);
+  else
+    segment =
+        builder.create<air::SegmentOp>(op.getLoc(), segmentSizes, segmentOpers);
+
+  builder.setInsertionPointToStart(&segment.getRegion().front());
+
+  SmallVector<Value, 2> herdSizes = {};
+  SmallVector<Value, 4> herdOpers;
+  for (Value v : segment.getIds()) {
+    herdOpers.push_back(v);
+  }
+  for (Value v : segment.getSize()) {
+    herdOpers.push_back(v);
+  }
+  for (Value v : segment.getKernelArguments()) {
+    herdOpers.push_back(v);
+  }
+  for (unsigned i = 0; i < op.getNumDims(); i++) {
+    herdSizes.push_back(
+        builder.clone(*op.getSizeOperands()[i].getDefiningOp())->getResult(0));
+  }
+
+  air::HerdOp herdOp = nullptr;
+  if (op.getAsyncToken())
+    herdOp = builder.create<air::HerdOp>(op.getLoc(), SmallVector<Value>{},
+                                         herdSizes,
+                                         segment.getKernelArguments(), true);
+  else
+    herdOp = builder.create<air::HerdOp>(op.getLoc(), herdSizes,
+                                         segment.getKernelArguments());
+
+  IRMapping remap;
+  for (unsigned i = 0; i < op.getNumDims(); i++) {
+    remap.map(op.getIds()[i], herdOp.getIds()[i]);
+    remap.map(op.getSize()[i], herdOp.getSize()[i]);
+  }
+  for (unsigned i = 0; i < op.getNumKernelOperands(); i++) {
+    remap.map(op.getKernelArgument(i),
+              herdOp.getKernelArgument(launch.getNumDims() * 2 + i));
+  }
+
+  builder.setInsertionPointToStart(&herdOp.getRegion().front());
+  for (auto &o : op.getBody().front().getOperations()) {
+    builder.clone(o, remap);
+  }
+
+  // Terminators
+  builder.setInsertionPointToEnd(&segment.getRegion().front());
+  builder.create<air::SegmentTerminatorOp>(builder.getUnknownLoc());
+  builder.setInsertionPointToEnd(&launch.getRegion().front());
+  builder.create<air::LaunchTerminatorOp>(builder.getUnknownLoc());
+
+  // Copy over herd name
+  if (auto attr =
+          op->getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName())) {
+    std::string name = attr.getValue().str();
+    herdOp->setAttr(SymbolTable::getSymbolAttrName(),
+                    StringAttr::get(op->getContext(), name));
+  }
+
+  if (auto token = op.getAsyncToken()) {
+    replaceAllUsesInRegionWith(token, launch.getAsyncToken(),
+                               *op->getParentRegion());
+  }
+  op->erase();
+  return;
+}
+
 class ScfParToHerdConversion : public OpRewritePattern<scf::ParallelOp> {
 public:
   using OpRewritePattern<scf::ParallelOp>::OpRewritePattern;
 
   ScfParToHerdConversion(MLIRContext *ctx,
                          SmallPtrSet<Operation *, 8> &filteredOps,
-                         llvm::SmallSet<air::HerdOp, 2> &replacementOps)
+                         llvm::SmallSet<air::HerdOp, 2> &replacementOps,
+                         int firstDim)
       : OpRewritePattern(ctx), filteredOps(filteredOps),
-        replacementOps(replacementOps){};
+        replacementOps(replacementOps), firstDim(firstDim){};
 
   LogicalResult matchAndRewrite(scf::ParallelOp parOp,
                                 PatternRewriter &rewriter) const override {
@@ -1397,16 +1538,19 @@ public:
       else
         args.push_back(v);
     }
+
+    int idx0 = firstDim;
+    int idx1 = (firstDim + 1) % 2;
     SmallVector<Value, 2> dims{
-        rewriter.create<arith::ConstantIndexOp>(loc, bounds[0]),
-        rewriter.create<arith::ConstantIndexOp>(loc, bounds[1])};
+        rewriter.create<arith::ConstantIndexOp>(loc, bounds[idx0]),
+        rewriter.create<arith::ConstantIndexOp>(loc, bounds[idx1])};
     auto herdOp = rewriter.create<air::HerdOp>(op.getLoc(), dims, args);
     auto &bb = herdOp.getBody().front();
     auto ivs = op.getInductionVars();
 
-    ivs[0].replaceAllUsesWith(herdOp.getIds()[0]);
+    ivs[0].replaceAllUsesWith(herdOp.getIds()[idx0]);
     if (op.getNumLoops() == 2)
-      ivs[1].replaceAllUsesWith(herdOp.getIds()[1]);
+      ivs[1].replaceAllUsesWith(herdOp.getIds()[idx1]);
 
     auto &body = op.getBody()->getOperations();
     bb.getOperations().splice(bb.begin(), body, body.begin(), --body.end());
@@ -1432,6 +1576,7 @@ public:
 private:
   llvm::SmallPtrSet<Operation *, 8> filteredOps;
   llvm::SmallSet<air::HerdOp, 2> &replacementOps;
+  int firstDim;
 };
 
 class ScfParToLaunchConversion : public OpRewritePattern<scf::ParallelOp> {
@@ -1945,7 +2090,8 @@ struct ParallelToHerdPass : public air::ParallelToHerdBase<ParallelToHerdPass> {
 
     RewritePatternSet patterns(context);
     patterns.add<AffineParToHerdConversion>(context);
-    patterns.add<ScfParToHerdConversion>(context, filteredOps, replacementOps);
+    patterns.add<ScfParToHerdConversion>(context, filteredOps, replacementOps,
+                                         clFirstDim);
 
     ConversionTarget target(*context);
 
@@ -2044,6 +2190,30 @@ struct ParallelToLaunchPass
   }
 };
 
+struct InsertEmptyLaunchOverHerdPass
+    : public air::InsertEmptyLaunchOverHerdBase<InsertEmptyLaunchOverHerdPass> {
+
+  InsertEmptyLaunchOverHerdPass() = default;
+  InsertEmptyLaunchOverHerdPass(const InsertEmptyLaunchOverHerdPass &pass) {}
+
+  void getDependentDialects(::mlir::DialectRegistry &registry) const override {
+    registry.insert<air::airDialect>();
+    registry.insert<linalg::LinalgDialect>();
+  }
+
+  void runOnOperation() override {
+    auto module = getOperation();
+    auto context = module.getContext();
+
+    module.walk([&](air::HerdOp op) {
+      if (!op->getParentOfType<air::LaunchOp>())
+        InsertEmptyLaunchOverHerd(op);
+      else if (!op->getParentOfType<air::SegmentOp>())
+        InsertEmptyLaunchOverHerd(op);
+    });
+  }
+};
+
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -2059,7 +2229,8 @@ transform::ParToHerdOp::applyToOne(scf::ParallelOp target,
   llvm::SmallSet<air::HerdOp, 2> herdOps;
   llvm::SmallSet<Operation *, 8> filteredOps;
   filteredOps.insert(target);
-  patterns.add<ScfParToHerdConversion>(ctx, filteredOps, herdOps);
+  patterns.add<ScfParToHerdConversion>(ctx, filteredOps, herdOps,
+                                       getFirstDim());
   (void)applyPatternsAndFoldGreedily(
       target->getParentWithTrait<OpTrait::IsIsolatedFromAbove>(),
       std::move(patterns));
@@ -2136,6 +2307,10 @@ std::unique_ptr<mlir::Pass> createCopyToDmaPass() {
 
 std::unique_ptr<mlir::Pass> createDmaToChannelPass() {
   return std::make_unique<DmaToChannelPass>();
+}
+
+std::unique_ptr<mlir::Pass> createInsertEmptyLaunchOverHerdPass() {
+  return std::make_unique<InsertEmptyLaunchOverHerdPass>();
 }
 
 } // namespace air
