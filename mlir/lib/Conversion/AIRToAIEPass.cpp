@@ -1129,10 +1129,8 @@ private:
                                            const std::vector<Value> &consTile,
                                            int depth, StringRef name) const {
     AIE::ObjectFifoCreateOp fifo = builder.create<AIE::ObjectFifoCreateOp>(
-        builder.getUnknownLoc(), datatype, prodTile, consTile,
-        builder.getIntegerAttr(builder.getI32Type(), depth));
-    fifo->setAttr(SymbolTable::getSymbolAttrName(),
-                  builder.getStringAttr(name));
+        builder.getUnknownLoc(), name, prodTile, consTile,
+        builder.getIntegerAttr(builder.getI32Type(), depth), datatype);
     return fifo;
   }
 
@@ -1140,14 +1138,16 @@ private:
   void rewriteChannelAllocs(PatternRewriter &rewriter, MyOp op,
                             AIE::ObjectFifoCreateOp objFifo,
                             AIE::ObjectFifoPort port) const {
-    auto elementType =
-        objFifo.getType().dyn_cast<AIE::AIEObjectFifoType>().getElementType();
+
+    AIE::AIEObjectFifoType ofTy =
+        cast<AIE::AIEObjectFifoType>(objFifo.getElemType());
+    auto elementType = ofTy.getElementType();
     auto acqType = AIE::AIEObjectFifoSubviewType::get(elementType);
 
     rewriter.setInsertionPoint(&op->getBlock()->front());
     AIE::ObjectFifoAcquireOp producerAcq =
-        rewriter.create<AIE::ObjectFifoAcquireOp>(rewriter.getUnknownLoc(),
-                                                  acqType, port, objFifo, 1);
+        rewriter.create<AIE::ObjectFifoAcquireOp>(
+            rewriter.getUnknownLoc(), acqType, port, objFifo.getName(), 1);
     rewriter.setInsertionPointAfter(producerAcq);
     AIE::ObjectFifoSubviewAccessOp producerAccess =
         rewriter.create<AIE::ObjectFifoSubviewAccessOp>(
@@ -1168,7 +1168,7 @@ private:
       if (auto dealloc = dyn_cast<memref::DeallocOp>(u)) {
         rewriter.setInsertionPoint(&op->getBlock()->back());
         rewriter.create<AIE::ObjectFifoReleaseOp>(dealloc->getLoc(), port,
-                                                  objFifo, 1);
+                                                  objFifo.getName(), 1);
         // Delete ops at the end of the rewrite pattern to avoid repeatedly
         // deleting the same op
         push_back_if_unique<Operation *>(erased_deallocs,
@@ -2322,12 +2322,6 @@ public:
         continue;
       seen.insert(device);
 
-      specializeHerdAffineIf(device);
-      lowerAirExecute(device);
-      lowerScfAirTokens(device);
-
-      allocL1Buffers(device, tileToHerdMap);
-
       // The shim tile allocation is not unified for dma and channel lowering
       // so we disallow a mix of dma and channel ops.
       bool hasDma = false;
@@ -2349,16 +2343,30 @@ public:
 
       if (clUseObjFifo) {
 
-      specializeChannelBundle(device);
-
-      lowerAIRMemcpyOp<air::DmaMemcpyNdOp>(device, shimDmaAlloc);
-
-      if (clUseObjFifo) {
+        specializeHerdAffineIf(device);
+        lowerAirExecute(device);
+        lowerScfAirTokens(device);
+        specializeChannelBundle(device);
+        renumberChannelOps(device.getBody());
         LowerAIRPingPong(device);
         ShimTileAllocator shimTileAlloc(device.getTargetModel());
         lowerAIRChannels(device, shimTileAlloc);
+        allocL1Buffers(device, tileToHerdMap);
       } else {
-        lowerAIRMemcpyOp<air::ChannelInterface>(device, shimDmaAlloc);
+
+        cloneL2AndL3MemcpysToDeviceOp(builder, device, module, true, true);
+        specializeHerdAffineIf(device);
+        lowerAirExecute(device);
+        lowerScfAirTokens(device);
+
+        allocL1Buffers(device, tileToHerdMap);
+        allocL2Buffers(device);
+
+        // Copy over L2 and L3 memcpy ops into device op
+        builder.setInsertionPointToStart(device.getBody());
+        specializeChannelBundle(device);
+        renumberChannelOps(device.getBody(), chan_renumber_reverse_map);
+        lowerAIRMemcpyOp<air::ChannelInterface>(device, shimDmaAlloc, options);
       }
 
       lowerAIRMemcpyOp<air::DmaMemcpyNdOp>(device, shimDmaAlloc, options);
