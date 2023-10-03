@@ -158,6 +158,10 @@ def AIRToAIE : Pass<"air-to-aie", "ModuleOp"> {
            /*default=*/"false",
            "Choose whether to lower data movement ops to aie.objectFifo, or "
            "directly to aie.locks.">,
+    Option<"clGenerateShimDMA", "generate-shim-dma", "bool",
+           /*default=*/"false",
+           "Choose whether to schedule shim data movement via generating AIE "
+           " shim DMA program, or AIR runtime.">,
   ];
   let description = [{
     This pass converts AIR dialect `herd` and `segment` operations into AIE
@@ -299,6 +303,15 @@ def AIRPipelineToAffine : Pass<"air-pipeline-to-affine", "ModuleOp"> {
           /*default=*/"\"buffers\"",
           "Type of lowering to use for core-to-core communication. Can be 'buffer' or 'getput'">
   ];
+}
+
+def InsertEmptyLaunchOverHerd : Pass<"air-insert-launch-and-segment-around-herd", "ModuleOp"> {
+  let summary = "Insert segment and launch ops around herd op";
+  let constructor = "xilinx::air::createInsertEmptyLaunchOverHerdPass()";
+  let description =  [{
+    This pass inserts launch and segment operations around herd op, if a herd op 
+    does not have a parent launch or segment operation.
+  }];
 }
 
 #endif
